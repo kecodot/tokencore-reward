@@ -2,9 +2,9 @@
 # Python Flask + Node.js TokenCore Bridge 双服务容器
 FROM python:3.12-slim
 
-# 安装 Node.js 22（TokenCore WASM 需要 22+）
+# 安装 Node.js 22 + bash（TokenCore WASM 需要 Node 22+）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
+    curl ca-certificates bash \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -22,17 +22,14 @@ RUN cd wallet-bridge && npm install --production
 # ---- 应用代码 ----
 COPY . .
 
-# ---- 启动脚本 ----
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# 确保启动脚本可执行
+RUN chmod +x /app/docker-entrypoint.sh
 
-# 暴露 Flask 端口
+# 暴露端口（Railway 会通过 $PORT 覆盖）
 EXPOSE 5000
 
 # 环境变量默认值
 ENV TOKENCORE_BRIDGE=http://localhost:5001
-ENV WEB3_PROVIDER_URI=https://sepolia.infura.io/v3/demo
-ENV FLASK_SECRET_KEY=change-me-in-production
-ENV FERNET_KEY=
+ENV WEB3_PROVIDER_URI=https://sepolia-infura.io/v3/demo
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
