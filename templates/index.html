@@ -100,6 +100,20 @@
             <p><strong>ETH 余额 (Sepolia):</strong> <span id="eth-balance">—</span> ETH</p>
             <p><strong>平台积分:</strong> <span id="platform-balance">—</span> TOKEN</p>
         </article>
+
+        <article>
+            <h4>导出助记词</h4>
+            <p style="font-size:.85em;color:var(--pico-muted-color)">助记词是恢复钱包的唯一凭证，请勿泄露</p>
+            <label>输入 Keystore 密码验证:
+                <input type="password" id="mnemonic-password" placeholder="注册时生成的密码">
+            </label>
+            <button onclick="exportMnemonic()" class="secondary">导出助记词</button>
+            <div id="mnemonic-result" style="margin-top:.5rem;display:none">
+                <div class="wallet-addr" id="mnemonic-words" style="word-break:break-word"></div>
+                <p class="badge badge-warning" style="margin-top:.25rem">请立即抄写保存，关闭页面后将无法再次查看</p>
+            </div>
+        </article>
+
         <h4>交易记录</h4>
         <div id="tx-list"></div>
     </section>

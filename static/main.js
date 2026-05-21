@@ -89,8 +89,17 @@ async function doRegister() {
     if (status === 200 && data.success) {
         const div = document.getElementById('register-result');
         div.style.display = 'block';
+        let mnemonicHtml = '';
+        if (data.mnemonic) {
+            mnemonicHtml = `<div style="margin-top:.5rem;padding:.5rem;background:#fff3e0;border-radius:8px">
+                <strong>助记词（请立即抄写保存！）</strong>
+                <p class="wallet-addr" style="margin:.25rem 0">${escHtml(data.mnemonic)}</p>
+                <small style="color:#e65100">助记词仅显示一次，丢失后无法恢复钱包</small>
+            </div>`;
+        }
         div.innerHTML = `<p>注册成功！</p>
             <p>钱包地址: <code>${data.wallet_address}</code></p>
+            ${mnemonicHtml}
             <p class="badge badge-success">TokenCore @consenlabs/tcx-wasm 已创建 HD 钱包</p>
             <p style="font-size:.85em; color:var(--pico-muted-color)">Keystore 已加密存储，使用 PBKDF2 密钥派生</p>`;
         document.getElementById('auth-password').value = '';
@@ -240,6 +249,25 @@ async function loadWallet() {
             <small style="float:right;color:var(--pico-muted-color)">${(tx.created_at || '').slice(0, 16)}</small>
         </div>`;
     }).join('');
+}
+
+// ---- Mnemonic Export ----
+async function exportMnemonic() {
+    const password = document.getElementById('mnemonic-password').value.trim();
+    if (!password) {
+        showToast('请输入 Keystore 密码', true);
+        return;
+    }
+    const { status, data } = await API.post('/api/wallet/mnemonic', { password });
+    const div = document.getElementById('mnemonic-result');
+    if (status === 200 && data.success) {
+        document.getElementById('mnemonic-words').textContent = data.mnemonic;
+        div.style.display = 'block';
+        showToast('助记词已导出，请安全保管');
+    } else {
+        div.style.display = 'none';
+        showToast(data.error || '导出失败', true);
+    }
 }
 
 // ---- Rewards ----

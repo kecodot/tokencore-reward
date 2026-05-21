@@ -588,6 +588,7 @@ def api_register():
         "success": True,
         "username": username,
         "wallet_address": wallet_result["address"],
+        "mnemonic": wallet_result.get("mnemonic", ""),
         "message": "注册成功！钱包已通过 TokenCore @consenlabs/tcx-wasm 自动创建",
     })
 
@@ -866,6 +867,42 @@ def api_wallet():
     })
 
 
+# ---- 助记词导出 ----
+@app.route("/api/wallet/mnemonic", methods=["POST"])
+@login_required
+def api_wallet_mnemonic():
+    """通过 TokenCore bridge 导出助记词（需要用户输入 keystore 密码确认）"""
+    db = get_db()
+    data = request.get_json() or {}
+    password = (data.get("password") or "").strip()
+
+    if not password:
+        return jsonify({"error": "请输入 keystore 密码以验证身份"}), 400
+
+    user = db.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    ks = decrypt_key(user["wallet_keystore"])
+    stored_pw = decrypt_key(user["wallet_keystore_password"])
+
+    if password != stored_pw:
+        return jsonify({"error": "密码错误"}), 403
+
+    # 调用 TokenCore bridge 导出助记词
+    result = requests.post(
+        f"{TOKENCORE_BRIDGE}/api/wallet/export-mnemonic",
+        json={"keystoreJson": ks, "password": password},
+        timeout=30,
+    )
+    data = result.json()
+
+    if data.get("success"):
+        return jsonify({
+            "success": True,
+            "mnemonic": data["mnemonic"],
+            "warning": "请安全保管助记词，任何人获取助记词即可控制你的钱包",
+        })
+    return jsonify({"error": data.get("error", "导出失败")}), 500
+
+
 # ---- 交易记录 ----
 @app.route("/api/transactions", methods=["GET"])
 @login_required
@@ -924,7 +961,15 @@ def api_bitrefill_webhook():
 #  入口
 # ============================================================
 # 初始化数据库（模块导入时执行，兼容 gunicorn）
-init_db()
+try:
+    init_db()
+except Exception as e:
+    print(f"[ERROR] 数据库初始化失败: {e}")
+
+# Railway 健康检查端点（极简，不查数据库）
+@app.route("/healthz")
+def healthz():
+    return "OK", 200, {"Content-Type": "text/plain"}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
