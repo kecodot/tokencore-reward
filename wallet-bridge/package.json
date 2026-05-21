@@ -1,0 +1,14 @@
+{
+  "name": "wallet-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "TokenCore Wallet Bridge — wraps @consenlabs/tcx-wasm behind REST endpoints",
+  "scripts": {
+    "start": "node --experimental-wasm-stringref server.js",
+    "dev": "node --experimental-wasm-stringref --watch server.js"
+  },
+  "dependencies": {
+    "@consenlabs/tcx-wasm": "^0.9.1",
+    "express": "^5.2.1"
+  }
+}

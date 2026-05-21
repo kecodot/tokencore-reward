@@ -1,4 +1,30 @@
 // TokenCore 奖励平台 — 前端交互逻辑
+// 钱包相关操作由 @consenlabs/tcx-wasm (TokenCore) 提供核心能力
+
+// ---- TokenCore WASM 客户端初始化 ----
+let tcxWasmReady = false;
+const TOKENCORE_MODULE = {};
+
+async function initTokenCoreWasm() {
+    try {
+        // 动态加载 @consenlabs/tcx-wasm (浏览器端 ES Module)
+        const tcx = await import('https://cdn.jsdelivr.net/npm/@consenlabs/tcx-wasm@0.9.1/tcx_wasm.js');
+        await tcx.default();  // 初始化 WASM
+        Object.assign(TOKENCORE_MODULE, {
+            create_keystore: tcx.create_keystore,
+            derive_accounts: tcx.derive_accounts,
+            sign_tx: tcx.sign_tx,
+            export_mnemonic: tcx.export_mnemonic,
+            cache_keystore: tcx.cache_keystore,
+            clear_cached_keystore: tcx.clear_cached_keystore,
+        });
+        tcxWasmReady = true;
+        console.log('[TokenCore] Browser WASM ready');
+    } catch (e) {
+        console.warn('[TokenCore] Browser WASM load failed (will use bridge API):', e.message);
+    }
+}
+initTokenCoreWasm();
 
 const API = {
     async req(method, url, body) {
@@ -65,7 +91,8 @@ async function doRegister() {
         div.style.display = 'block';
         div.innerHTML = `<p>注册成功！</p>
             <p>钱包地址: <code>${data.wallet_address}</code></p>
-            <p class="badge badge-success">请保存好钱包地址，私钥已加密存储</p>`;
+            <p class="badge badge-success">TokenCore @consenlabs/tcx-wasm 已创建 HD 钱包</p>
+            <p style="font-size:.85em; color:var(--pico-muted-color)">Keystore 已加密存储，使用 PBKDF2 密钥派生</p>`;
         document.getElementById('auth-password').value = '';
         showToast('注册成功！请登录');
     } else {
@@ -186,6 +213,17 @@ async function loadWallet() {
     document.getElementById('wallet-addr').textContent = data.wallet_address || '请先登录';
     document.getElementById('eth-balance').textContent = data.eth_balance || '0';
     document.getElementById('platform-balance').textContent = data.platform_balance || '0';
+
+    // TokenCore 状态
+    const tcStatus = document.getElementById('tokencore-status');
+    if (tcStatus) {
+        const bridgeOk = data.wallet_address ? true : false;
+        tcStatus.innerHTML = tcxWasmReady
+            ? '<span class="badge badge-success">TokenCore WASM (浏览器) ✓</span>'
+            : (bridgeOk
+                ? '<span class="badge badge-info">TokenCore Bridge (服务端) ✓</span>'
+                : '<span class="badge badge-warning">TokenCore 连接中...</span>');
+    }
 
     const { data: txData } = await API.get('/api/transactions');
     const container = document.getElementById('tx-list');

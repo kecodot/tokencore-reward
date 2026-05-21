@@ -1,7 +1,11 @@
 """
 TokenCore + Claude AI + Bitrefill 奖励平台
 ===========================================
-用户注册自动生成钱包 → AI生成任务 → 完成任务领取Token/NFT/礼品卡奖励
+用户注册自动生成钱包(通过TokenCore WASM) → AI生成任务 → 完成任务领取Token/NFT/礼品卡奖励
+
+TokenCore 集成方式:
+  钱包创建 & 交易签名 → 调用 wallet-bridge (Node.js, 封装 @consenlabs/tcx-wasm)
+  链上交互 & 余额查询 → 使用 web3.py
 """
 import os
 import re
@@ -18,7 +22,6 @@ from flask import Flask, request, jsonify, session, send_from_directory, g
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 from web3 import Web3
-from eth_account import Account
 from openai import OpenAI
 
 # ---------- 配置 ----------
@@ -45,7 +48,14 @@ w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI))
 
 DATABASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reward_platform.db")
 
+# TokenCore 钱包桥接服务地址（Node.js wallet-bridge）
+TOKENCORE_BRIDGE = os.getenv("TOKENCORE_BRIDGE", "http://localhost:5001")
+
 # 平台发奖钱包（用于给用户发 Token/NFT）
+# 优先使用 PLATFORM_KEYSTORE_JSON（TokenCore keystore），
+# 兼容旧的 PLATFORM_PRIVATE_KEY 方式
+PLATFORM_KEYSTORE_JSON = os.getenv("PLATFORM_KEYSTORE_JSON", "")
+PLATFORM_KEYSTORE_PASSWORD = os.getenv("PLATFORM_KEYSTORE_PASSWORD", "")
 PLATFORM_PRIVATE_KEY = os.getenv("PLATFORM_PRIVATE_KEY", "")
 PLATFORM_ADDRESS = os.getenv("PLATFORM_ADDRESS", "")
 
@@ -83,7 +93,8 @@ def init_db():
             username        TEXT UNIQUE NOT NULL,
             password_hash   TEXT NOT NULL,
             wallet_address  TEXT NOT NULL,
-            wallet_private_key TEXT NOT NULL,
+            wallet_keystore TEXT NOT NULL,
+            wallet_keystore_password TEXT NOT NULL,
             balance         REAL DEFAULT 0,
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -140,6 +151,16 @@ def init_db():
     """)
     db.commit()
 
+    # 数据库迁移：wallet_private_key → wallet_keystore + wallet_keystore_password
+    try:
+        db.execute("ALTER TABLE users ADD COLUMN wallet_keystore TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        db.execute("ALTER TABLE users ADD COLUMN wallet_keystore_password TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+
     # 插入默认任务（如果为空）
     count = db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     if count == 0:
@@ -181,18 +202,58 @@ def decrypt_key(encrypted_key: str) -> str:
 
 
 # ============================================================
-#  Wallet 模块 (TokenCore 替代 — web3.py + eth-account)
+#  Wallet 模块 — 通过 TokenCore Bridge (基于 @consenlabs/tcx-wasm)
 # ============================================================
 class WalletModule:
-    """EVM 钱包操作封装"""
+    """
+    EVM 钱包操作封装
+    核心能力（创建/签名）通过 TokenCore bridge 调用 @consenlabs/tcx-wasm
+    链上广播仍使用 web3.py
+    """
 
     @staticmethod
-    def generate_wallet() -> dict:
-        """创建新钱包 → 返回地址和加密私钥"""
-        acct = Account.create()
+    def _bridge(endpoint: str, payload: dict) -> dict:
+        """调用 TokenCore wallet-bridge"""
+        try:
+            resp = requests.post(
+                f"{TOKENCORE_BRIDGE}/api/wallet/{endpoint}",
+                json=payload,
+                timeout=30,
+            )
+            return resp.json()
+        except requests.exceptions.ConnectionError:
+            return {"success": False, "error": f"无法连接 TokenCore bridge ({TOKENCORE_BRIDGE})，请先启动 wallet-bridge 服务"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def generate_wallet(password: str = None, network: str = "TESTNET") -> dict:
+        """
+        通过 TokenCore bridge 创建新钱包
+        调用 @consenlabs/tcx-wasm 的 create_keystore + derive_accounts
+        """
+        import secrets
+        import string
+        if not password:
+            password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(24))
+
+        result = WalletModule._bridge("create", {
+            "password": password,
+            "network": network,
+        })
+
+        if not result.get("success"):
+            return {"success": False, "error": result.get("error", "创建钱包失败")}
+
+        keystore = result.get("keystore", {})
+        account = result.get("account", {})
+
         return {
-            "address": acct.address,
-            "private_key": acct.key.hex(),
+            "success": True,
+            "address": account.get("address", ""),
+            "keystore_json": keystore.get("json", ""),
+            "keystore_password": password,   # 用户密码，用于解锁 keystore
+            "mnemonic": result.get("mnemonic", ""),
         }
 
     @staticmethod
@@ -205,17 +266,34 @@ class WalletModule:
             return 0.0
 
     @staticmethod
-    def send_token(private_key: str, to_address: str, amount: float) -> dict:
+    def send_token(keystore_json: str, keystore_password: str,
+                   to_address: str, amount: float,
+                   derivation_path: str = "m/44'/60'/0'/0/0") -> dict:
         """
-        发送 ERC-20 Token（USDT on Sepolia）
-        真实环境需：代币合约 ABI + gas 估算 + nonce 管理
+        通过 TokenCore bridge 签名 + web3.py 广播 ERC-20 转账
+        调用 @consenlabs/tcx-wasm 的 sign_tx
         """
         if not w3.is_connected():
             return {"success": False, "error": "Web3 未连接，请检查 WEB3_PROVIDER_URI"}
 
         try:
-            account = Account.from_key(private_key)
-            nonce = w3.eth.get_transaction_count(account.address)
+            # 先从 keystore 推导地址（核实发送方）
+            derive_result = WalletModule._bridge("derive", {
+                "keystoreJson": keystore_json,
+                "password": keystore_password,
+                "derivations": [{
+                    "chain": "ETHEREUM",
+                    "derivationPath": derivation_path,
+                    "chainId": "11155111",
+                    "network": "TESTNET",
+                }],
+            })
+            if not derive_result.get("success"):
+                return {"success": False, "error": f"推导地址失败: {derive_result.get('error')}"}
+            from_address = derive_result.get("accounts", [{}])[0].get("address", "")
+
+            # 获取 nonce
+            nonce = w3.eth.get_transaction_count(w3.to_checksum_address(from_address))
             gas_price = w3.eth.gas_price
 
             # ERC-20 transfer ABI 编码
@@ -226,36 +304,66 @@ class WalletModule:
                 + hex(amount_wei)[2:].rjust(64, "0")
             )
 
-            tx = {
-                "nonce": nonce,
-                "gasPrice": gas_price,
-                "gas": 100000,
-                "to": w3.to_checksum_address(USDT_CONTRACT),
-                "value": 0,
-                "data": data,
-                "chainId": 11155111,  # Sepolia
-            }
+            # TokenCore: 签名交易
+            sign_result = WalletModule._bridge("sign", {
+                "keystoreJson": keystore_json,
+                "password": keystore_password,
+                "chain": "ETHEREUM",
+                "derivationPath": derivation_path,
+                "input": {
+                    "nonce": str(nonce),
+                    "gasPrice": str(gas_price),
+                    "gasLimit": "100000",
+                    "to": USDT_CONTRACT,
+                    "value": "0",
+                    "data": data,
+                    "chainId": "11155111",
+                },
+            })
 
-            signed = w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-            return {"success": True, "tx_hash": tx_hash.hex()}
+            if not sign_result.get("success"):
+                return {"success": False, "error": f"TokenCore 签名失败: {sign_result.get('error')}"}
+
+            raw_tx = sign_result.get("signature") or sign_result.get("signedTx")
+            if not raw_tx:
+                return {"success": False, "error": "签名结果为空"}
+
+            # 广播已签名的交易
+            tx_hash = w3.eth.send_raw_transaction(raw_tx)
+            return {"success": True, "tx_hash": tx_hash.hex() if hasattr(tx_hash, 'hex') else str(tx_hash)}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     @staticmethod
-    def mint_nft(private_key: str, to_address: str, token_uri: str) -> dict:
+    def mint_nft(keystore_json: str, keystore_password: str,
+                 to_address: str, token_uri: str,
+                 derivation_path: str = "m/44'/60'/0'/0/0") -> dict:
         """
-        铸造 ERC-721 NFT
-        mint(to, tokenId, uri) — 需部署自己的 NFT 合约
+        通过 TokenCore bridge 签名 + web3.py 广播 NFT 铸造
+        调用 @consenlabs/tcx-wasm 的 sign_tx
         """
         if not w3.is_connected():
             return {"success": False, "error": "Web3 未连接"}
 
         try:
-            account = Account.from_key(private_key)
-            nonce = w3.eth.get_transaction_count(account.address)
+            derive_result = WalletModule._bridge("derive", {
+                "keystoreJson": keystore_json,
+                "password": keystore_password,
+                "derivations": [{
+                    "chain": "ETHEREUM",
+                    "derivationPath": derivation_path,
+                    "chainId": "11155111",
+                    "network": "TESTNET",
+                }],
+            })
+            if not derive_result.get("success"):
+                return {"success": False, "error": f"推导地址失败: {derive_result.get('error')}"}
+            from_address = derive_result.get("accounts", [{}])[0].get("address", "")
 
+            nonce = w3.eth.get_transaction_count(w3.to_checksum_address(from_address))
             token_id = int(datetime.datetime.utcnow().timestamp())
+
+            # mint(to, uint256, string) ABI 编码
             uri_hex = token_uri.encode().hex().rjust(128, "0")
             to_hex = w3.to_checksum_address(to_address)[2:].lower().rjust(64, "0")
             tid_hex = hex(token_id)[2:].rjust(64, "0")
@@ -269,19 +377,32 @@ class WalletModule:
                 + uri_hex
             )
 
-            tx = {
-                "nonce": nonce,
-                "gasPrice": w3.eth.gas_price,
-                "gas": 300000,
-                "to": w3.to_checksum_address(NFT_CONTRACT),
-                "value": 0,
-                "data": data,
-                "chainId": 11155111,
-            }
+            sign_result = WalletModule._bridge("sign", {
+                "keystoreJson": keystore_json,
+                "password": keystore_password,
+                "chain": "ETHEREUM",
+                "derivationPath": derivation_path,
+                "input": {
+                    "nonce": str(nonce),
+                    "gasPrice": str(w3.eth.gas_price),
+                    "gasLimit": "300000",
+                    "to": NFT_CONTRACT,
+                    "value": "0",
+                    "data": data,
+                    "chainId": "11155111",
+                },
+            })
 
-            signed = w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-            return {"success": True, "tx_hash": tx_hash.hex(), "token_id": token_id}
+            if not sign_result.get("success"):
+                return {"success": False, "error": f"TokenCore 签名失败: {sign_result.get('error')}"}
+
+            raw_tx = sign_result.get("signature") or sign_result.get("signedTx")
+            if not raw_tx:
+                return {"success": False, "error": "签名结果为空"}
+
+            tx_hash = w3.eth.send_raw_transaction(raw_tx)
+            return {"success": True, "tx_hash": tx_hash.hex() if hasattr(tx_hash, 'hex') else str(tx_hash),
+                    "token_id": token_id}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -450,20 +571,24 @@ def api_register():
     if exists:
         return jsonify({"error": "用户名已存在"}), 409
 
-    wallet = WalletModule.generate_wallet()
-    enc_pk = encrypt_key(wallet["private_key"])
+    wallet_result = WalletModule.generate_wallet()
+    if not wallet_result.get("success"):
+        return jsonify({"error": f"TokenCore 钱包创建失败: {wallet_result.get('error')}"}), 500
+
+    enc_ks = encrypt_key(wallet_result["keystore_json"])
+    enc_pw = encrypt_key(wallet_result["keystore_password"])
 
     db.execute(
-        "INSERT INTO users (username, password_hash, wallet_address, wallet_private_key) VALUES (?,?,?,?)",
-        (username, generate_password_hash(password), wallet["address"], enc_pk),
+        "INSERT INTO users (username, password_hash, wallet_address, wallet_keystore, wallet_keystore_password) VALUES (?,?,?,?,?)",
+        (username, generate_password_hash(password), wallet_result["address"], enc_ks, enc_pw),
     )
     db.commit()
 
     return jsonify({
         "success": True,
         "username": username,
-        "wallet_address": wallet["address"],
-        "message": "注册成功！钱包已自动创建",
+        "wallet_address": wallet_result["address"],
+        "message": "注册成功！钱包已通过 TokenCore @consenlabs/tcx-wasm 自动创建",
     })
 
 
@@ -652,9 +777,10 @@ def api_claim(task_id):
 
     # NFT 奖励
     elif reward_type == "nft":
-        pk = decrypt_key(user["wallet_private_key"])
+        ks = decrypt_key(user["wallet_keystore"])
+        ks_pw = decrypt_key(user["wallet_keystore_password"])
         token_uri = f"https://metadata.reward-platform.local/nft/{user_id}/{task_id}"
-        result = WalletModule.mint_nft(pk, user["wallet_address"], token_uri)
+        result = WalletModule.mint_nft(ks, ks_pw, user["wallet_address"], token_uri)
 
         status = "completed" if result["success"] else "failed"
         db.execute(
@@ -799,8 +925,10 @@ def api_bitrefill_webhook():
 # ============================================================
 if __name__ == "__main__":
     init_db()
-    print("=" * 50)
+    print("=" * 55)
     print("  TokenCore + Claude AI + Bitrefill 奖励平台")
+    print("  TokenCore Bridge: " + TOKENCORE_BRIDGE)
+    print("  Wallet 核心: @consenlabs/tcx-wasm v0.9.1")
     print("  运行地址: http://localhost:5000")
-    print("=" * 50)
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    print("=" * 55)
+    app.run(debug=False, host="0.0.0.0", port=5000)
