@@ -923,12 +923,15 @@ def api_bitrefill_webhook():
 # ============================================================
 #  入口
 # ============================================================
+# 初始化数据库（模块导入时执行，兼容 gunicorn）
+init_db()
+
 if __name__ == "__main__":
-    init_db()
+    port = int(os.getenv("PORT", 5000))
     print("=" * 55)
     print("  TokenCore + Claude AI + Bitrefill 奖励平台")
     print("  TokenCore Bridge: " + TOKENCORE_BRIDGE)
     print("  Wallet 核心: @consenlabs/tcx-wasm v0.9.1")
-    print("  运行地址: http://localhost:5000")
+    print(f"  运行地址: http://0.0.0.0:{port}")
     print("=" * 55)
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="0.0.0.0", port=port)
