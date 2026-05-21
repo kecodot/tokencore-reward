@@ -1,0 +1,26 @@
+# 虚拟环境
+venv/
+
+# 环境变量（含私钥等敏感信息）
+.env
+
+# SQLite 数据库
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# Flask 日志
+/tmp/
